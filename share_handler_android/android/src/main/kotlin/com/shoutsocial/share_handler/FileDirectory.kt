@@ -9,6 +9,7 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.*
 import android.webkit.MimeTypeMap
 import android.util.Log
@@ -16,16 +17,33 @@ import android.util.Log
 
 object FileDirectory {
 
+    private const val TAG = "FileDirectory"
+
+    /** Subfolder of the cache dir that receives copies of shared content. */
+    private const val SHARED_DIR = "share_handler"
+
     /**
      * Get a file path from a Uri. This will get the the path for Storage Access
      * Framework Documents, as well as the _data field for the MediaStore and
      * other file-based ContentProviders.
+     *
+     * Only `content://` Uris from other apps are accepted. A `file://` Uri, or a
+     * content Uri served by this app's own providers, would make this app hand
+     * its own private files to the caller as if the sender had shared them.
      *
      * @param context The context.
      * @param uri The Uri to query.
      * @author paulburke
      */
     fun getAbsolutePath(context: Context, uri: Uri): String? {
+        if (!"content".equals(uri.scheme, ignoreCase = true)) {
+            Log.w(TAG, "Rejected shared Uri with scheme ${uri.scheme}")
+            return null
+        }
+        if (isOwnProvider(context, uri)) {
+            Log.w(TAG, "Rejected shared Uri served by this app")
+            return null
+        }
 
         // DocumentProvider
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && DocumentsContract.isDocumentUri(context, uri)) {
@@ -69,11 +87,11 @@ object FileDirectory {
                 return getDataColumn(context, contentUri, selection, selectionArgs)
             }// MediaProvider
             // DownloadsProvider
-        } else if ("content".equals(uri.scheme, ignoreCase = true)) {
+        } else {
             return getDataColumn(context, uri, null, null)
         }
 
-        return uri.path
+        return null
     }
 
     /**
@@ -93,15 +111,23 @@ object FileDirectory {
             var cursor: Cursor? = null
             val column = "_display_name"
             val projection = arrayOf(column)
+            // A fresh folder per share: the name below comes from the sender, so it
+            // must never resolve to an existing file, and two shares with the same
+            // name must not overwrite each other.
+            val targetDir = File(context.cacheDir, "$SHARED_DIR/${UUID.randomUUID()}")
+            if (!targetDir.mkdirs()) {
+                Log.w(TAG, "Could not create a folder for the shared file")
+                return null
+            }
             var targetFile: File? = null
             try {
                 cursor = context.contentResolver.query(uri, projection, selection, selectionArgs, null)
                 if (cursor != null && cursor.moveToFirst()) {
                     val columnIndex = cursor.getColumnIndexOrThrow(column)
-                    val fileName = cursor.getString(columnIndex)
-                    Log.i("FileDirectory", "File name: $fileName")
-                    targetFile = File(context.cacheDir, fileName)
+                    targetFile = safeFileIn(targetDir, cursor.getString(columnIndex))
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not read the shared file name", e)
             } finally {
                 cursor?.close()
             }
@@ -116,13 +142,28 @@ object FileDirectory {
                     }
                 }
                 val type = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType)
-                targetFile = File(context.cacheDir, "${prefix}_${Date().time}.$type")
+                targetFile = File(targetDir, "${prefix}_${Date().time}.$type")
             }
             val uri = selectionArgs?.let { args -> uri.buildUpon().appendPath(args.first()).build() } ?: uri
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(targetFile).use { fileOut ->
-                    input.copyTo(fileOut)
+            try {
+                val input = context.contentResolver.openInputStream(uri)
+                if (input == null) {
+                    targetDir.deleteRecursively()
+                    return null
                 }
+                input.use {
+                    FileOutputStream(targetFile).use { fileOut ->
+                        it.copyTo(fileOut)
+                    }
+                }
+            } catch (e: IOException) {
+                Log.w(TAG, "Could not copy the shared file", e)
+                targetDir.deleteRecursively()
+                return null
+            } catch (e: SecurityException) {
+                Log.w(TAG, "No access to the shared file", e)
+                targetDir.deleteRecursively()
+                return null
             }
             return targetFile.path
         }
@@ -143,6 +184,43 @@ object FileDirectory {
         return null
     }
 
+
+    /**
+     * A file named [rawName] inside [dir], or null when the name is unusable.
+     *
+     * The name is chosen by the sending app (`_display_name`), so a name such as
+     * `../shared_prefs/x.xml` would otherwise write outside [dir]. Only its last
+     * path segment is kept, and the result must still resolve inside [dir].
+     */
+    private fun safeFileIn(dir: File, rawName: String?): File? {
+        val name = rawName
+            ?.substringAfterLast('/')
+            ?.substringAfterLast('\\')
+            ?.trim()
+            ?: return null
+        if (name.isEmpty() || name == "." || name == ".." || name.contains('\u0000')) {
+            Log.w(TAG, "Rejected shared file name")
+            return null
+        }
+        val file = File(dir, name)
+        return try {
+            if (file.canonicalFile.parentFile == dir.canonicalFile) {
+                file
+            } else {
+                Log.w(TAG, "Rejected shared file name outside the share folder")
+                null
+            }
+        } catch (e: IOException) {
+            null
+        }
+    }
+
+    /** Whether [uri] is served by one of this app's own content providers. */
+    private fun isOwnProvider(context: Context, uri: Uri): Boolean {
+        val authority = uri.authority ?: return false
+        val provider = context.packageManager.resolveContentProvider(authority, 0) ?: return false
+        return provider.packageName == context.packageName
+    }
 
     /**
      * @param uri The Uri to check.

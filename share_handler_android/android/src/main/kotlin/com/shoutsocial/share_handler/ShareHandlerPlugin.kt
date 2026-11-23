@@ -247,12 +247,17 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
       // Obtain the file name from the URI, including extension
       val fileName = getFileNameFromUri(contentResolver, uri, mimeType) ?: return null
 
-      // Create a new file in the cache directory with the correct file name
-      val newFile = File(applicationContext.cacheDir, fileName)
+      // The name comes from the sending app (DISPLAY_NAME): keep the copy inside
+      // a fresh share folder, as FileDirectory does, so a name such as
+      // `../files/x` cannot write outside the cache.
+      val shareDir = FileDirectory.newShareDir(applicationContext) ?: return null
+      val newFile = FileDirectory.safeFileIn(shareDir, fileName)
+        ?: File(shareDir, "file_${System.currentTimeMillis()}")
 
       // Copy the contents from the URI to the new file
       val success = copyFile(contentResolver, uri, newFile)
       if (!success) {
+        shareDir.deleteRecursively()
         return null
       }
 

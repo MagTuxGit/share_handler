@@ -114,11 +114,7 @@ object FileDirectory {
             // A fresh folder per share: the name below comes from the sender, so it
             // must never resolve to an existing file, and two shares with the same
             // name must not overwrite each other.
-            val targetDir = File(context.cacheDir, "$SHARED_DIR/${UUID.randomUUID()}")
-            if (!targetDir.mkdirs()) {
-                Log.w(TAG, "Could not create a folder for the shared file")
-                return null
-            }
+            val targetDir = newShareDir(context) ?: return null
             var targetFile: File? = null
             try {
                 cursor = context.contentResolver.query(uri, projection, selection, selectionArgs, null)
@@ -186,13 +182,29 @@ object FileDirectory {
 
 
     /**
+     * A fresh folder for one shared file, or null when it cannot be created.
+     *
+     * The file name comes from the sender, so it must never resolve to an
+     * existing file, and two shares with the same name must not overwrite each
+     * other.
+     */
+    internal fun newShareDir(context: Context): File? {
+        val dir = File(context.cacheDir, "$SHARED_DIR/${UUID.randomUUID()}")
+        if (!dir.mkdirs()) {
+            Log.w(TAG, "Could not create a folder for the shared file")
+            return null
+        }
+        return dir
+    }
+
+    /**
      * A file named [rawName] inside [dir], or null when the name is unusable.
      *
      * The name is chosen by the sending app (`_display_name`), so a name such as
      * `../shared_prefs/x.xml` would otherwise write outside [dir]. Only its last
      * path segment is kept, and the result must still resolve inside [dir].
      */
-    private fun safeFileIn(dir: File, rawName: String?): File? {
+    internal fun safeFileIn(dir: File, rawName: String?): File? {
         val name = rawName
             ?.substringAfterLast('/')
             ?.substringAfterLast('\\')
